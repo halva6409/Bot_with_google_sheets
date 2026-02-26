@@ -1,4 +1,4 @@
-import gspread, sqlite3, telebot, secret, re
+import gspread, sqlite3, telebot, secret, re, time
 from collections import OrderedDict
 from datetime import datetime
 from secret import user, sh, filename_db, SPREADSHEET_ID
@@ -10,7 +10,8 @@ month = "Мар"
 lst = sheet.worksheet(month)
 
 m = 'message'
-blocked = []
+blocked = []        
+search_row_ranges = [(2,2),(32,32),(62,62),(92,92),(122,122),(152,152)]  # list of (start_row, end_row) tuples or None = search whole sheet
 #Инициализация даты
 def check_date():
     today = datetime.now().day
@@ -21,10 +22,12 @@ def setting(m):
     parts = m.text.split()
     month = parts[1] 
     bot.reply_to(m, f"Принято, {month}")
+
 #Приветствие, постоянные кнопки
 @bot.message_handler(commands=['start'])
 def start(m):
     if m.from_user.id == user:
+        bot.send_chat_action(user, action='typing')
         keyboard = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
         b1 = telebot.types.KeyboardButton(text="Расписание на весь день")
         b2 = telebot.types.KeyboardButton(text="Сдед. дела")
@@ -32,6 +35,7 @@ def start(m):
         b4 = telebot.types.KeyboardButton(text="Прочее")
         keyboard.add(b1)
         keyboard.add(b2,b3,b4)
+        time.sleep(10)
         bot.send_message(user, f"Привет , я твой личный помошник, ты сам как создатель знаешь что я могу, спасибо что меня создал", reply_markup=keyboard)
     else:
         bot.send_message(m.chat.id , "Вы не пользователь бота")
@@ -40,96 +44,86 @@ def start(m):
 #Вывод дня
 @bot.message_handler(func=lambda message: message.text == "Расписание на весь день")
 def to_day(m):
-    today = check_date()  # число дня, int
-    found = None
+    bot.send_chat_action(user, action='typing')
+    today = check_date()  # Получаем число текущего дня (int)
+    all_values = lst.get_all_values()  # Загружаем все значения листа в память
+    print(all_values)
 
-    all_values = lst.get_all_values()  # все значения таблицы
-
-    # Ищем ячейку, которая содержит номер дня (любой формат, содержащий число дня)
-    day_re = re.compile(r"\b(\d{1,2})\b")
-    for r_idx, row_values in enumerate(all_values, start=1):
-        for c_idx, value in enumerate(row_values, start=1):
-            if not value:
+    # Найти ячейку с сегодняшним числом
+    day_re = re.compile(r"\b(\d{1,2})\b")  # Регекс для поиска 1-2 цифр
+    found = None  # Координаты найденной даты
+    for r_idx, row_vals in enumerate(all_values, start=1):  # Перебираем строки (1-based)
+        # Если заданы диапазоны строк — пропускаем строки вне диапазонов
+        if search_row_ranges:
+            in_any = False
+            for a, b in search_row_ranges:
+                if a <= r_idx <= b:
+                    in_any = True
+                    break
+            if not in_any:
                 continue
-            sval = value.strip()
-            mnum = day_re.search(sval)
-            num = None
+        for c_idx, cell_val in enumerate(row_vals, start=1):  # Перебираем ячейки в строке (1-based)
+            if not cell_val:  # Пропускаем пустые ячейки
+                continue
+            s = cell_val.strip()  # Убираем пробелы по краям
+            mnum = day_re.search(s)  # Ищем число в тексте ячейки
+            num = None  # Временная переменная для найденного числа
             if mnum:
                 try:
-                    num = int(mnum.group(1))
+                    num = int(mnum.group(1))  # Преобразуем найденную подстроку в int
+                    print(num)
                 except Exception:
-                    num = None
-            # Сравнение по извлечённому числу или по точной строке
-            if num == today or sval == str(today):
-                found = {'row': r_idx, 'col': c_idx}
-                break
-        if found:
+                    num = None  # Если не получилось — оставляем None
+            if num == today or s == str(today):  # Совпадение по числу или по точной строке
+                found = {'row': r_idx, 'col': c_idx}  # Запоминаем координаты
+                break  # Выходим из цикла по столбцам
+        if found:  # Если нашли — выходим из внешнего цикла
             break
 
-    if not found:
+    if not found:  # Если дата не найдена — сообщаем и выходим
+        bot.send_message(m.chat.id, "Дата не найдена")
         return
 
-    row = found['row']
-    col = found['col']
+    row = found['row']  # Номер строки с датой
+    col = found['col']  # Номер столбца с датой
 
-    # Отправляем в телеграм и печатаем в терминал: сначала 6 строк после даты (исключая дату),
-    # затем пропускаем одну строку (например, 'Обед'), затем снова 6 строк и т.д.
-    groups = 3
-    start_row = row + 1
-    sections = OrderedDict()
-    last_label = None
-    # Собираем строки по меткам (колонка 1) в порядке появления
-    for g in range(groups):
-        for i in range(6):
-            rpos = start_row + g * (6 + 1) + i
-            try:
-                label = lst.cell(rpos, 1).value
-            except Exception:
-                label = None
-            try:
-                v1 = lst.cell(rpos, col).value
-                v2 = lst.cell(rpos, col + 1).value
-            except Exception:
-                v1 = None
-                v2 = None
-            lab = None
-            if label and str(label).strip():
-                lab = str(label).strip()
-                if lab != last_label:
-                    if lab not in sections:
-                        sections[lab] = []
-                    last_label = lab
-            # Если метки ещё не было и есть предыдущая — используем предыдущую
-            if lab is None and last_label is not None:
-                lab = last_label
-            # Если нет метки и нет last_label — используем 'Без секции'
-            if lab is None:
-                lab = 'Без секции'
-                if lab not in sections:
-                    sections[lab] = []
-            # Проверяем содержимое строки
-            has_content = False
-            if v1 and str(v1).strip():
-                has_content = True
-            if v2 and str(v2).strip():
-                has_content = True
-            # Добавляем пустую секцию (если ещё не добавлена) — пользователь просил видеть 'Прочее' даже если пусто
+    sections = OrderedDict()  # Упорядоченный словарь для секций (метка -> список строк)
+    last_label = None  # Последняя непустая метка (для наследования меток)
+
+    # Проходим следующие 20 строк после строки с датой, пропуская каждую 7-ю
+    for offset in range(1, 21):
+        if offset % 7 == 0:  # Пропуск каждой 7-ой строки (как в оригинальной логике)
+            continue
+        rpos = row + offset  # Фактический индекс строки в таблице
+        row_vals = all_values[rpos - 1] if 0 <= rpos - 1 < len(all_values) else []  # Берём строку или пустую
+        label = (row_vals[0].strip() if len(row_vals) >= 1 and row_vals[0] else "")  # Метка из первой колонки
+        v1 = (row_vals[col - 1].strip() if len(row_vals) >= col and row_vals[col - 1] else "")  # Значение в колонке даты
+        v2 = (row_vals[col].strip() if len(row_vals) >= col + 1 and row_vals[col] else "")  # Доп. колонка рядом
+
+        if label:  # Если в первой колонке есть метка
+            lab = label  # Используем её
+            last_label = lab  # Запоминаем как последнюю метку
+            if lab not in sections:
+                sections[lab] = []  # Создаём список для новой секции
+        elif last_label:  # Если метки нет, но есть предыдущая — используем её
+            lab = last_label
+        else:  # Если ни метки, ни предыдущей — помещаем в 'Без секции'
+            lab = 'Без секции'
             if lab not in sections:
                 sections[lab] = []
-            # Если есть содержимое — добавляем строку
-            if has_content:
-                line = f"{v1} -- {v2}"
-                sections[lab].append(line)
-    # Отправляем каждую секцию отдельным сообщением: сначала заголовок (метка), затем её строки (если есть)
-    for lab, items in sections.items():
-        if items:
-            msg = lab + "\n" + "\n".join(items)
-        else:
-            msg = lab
+
+        if lab not in sections:
+            sections[lab] = []  # Гарантируем наличие ключа
+
+        if v1 or v2:  # Если есть содержимое — добавляем строку в секцию
+            sections[lab].append(f"{v1} -- {v2}")
+
+    for lab, items in sections.items():  # Отправляем каждую секцию сообщением
+        msg = lab + ("\n" + "\n".join(items) if items else "")  # Формируем текст: заголовок + строки
         try:
-            bot.send_message(m.chat.id, msg)
+            bot.send_message(m.chat.id, msg)  # Отправка пользователю
         except Exception:
-            pass
+            pass  # Игнорируем ошибки отправки
 
         
 
